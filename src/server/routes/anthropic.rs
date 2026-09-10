@@ -233,7 +233,7 @@ async fn non_stream_messages(
 
     let model_id = state.display_model_id().to_string();
     let prompt_cache_enabled = state.prompt_cache.is_some();
-    let prepared = match prepare_chat_request_with_cache(
+    let mut prepared = match prepare_chat_request_with_cache(
         &state.chat_template,
         &translated.chat_request,
         live.chat_template_kwargs.as_ref(),
@@ -264,6 +264,12 @@ async fn non_stream_messages(
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
     options.image_soft_tokens = prepared.image_soft_tokens;
+    // A native chat renderer (Kimi K3's XTML format, #1338) produced the
+    // prompt as token ids. Handing them to the provider is what keeps the
+    // rendered structure intact: re-tokenizing `prepared.prompt` would have to
+    // re-recognize control-token spellings, which is the injection surface the
+    // native renderer closes. `None` for every template-rendered request.
+    options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
     // Forced tool-call grammar (#1319), built at the request boundary.
     options.structured = structured;
@@ -393,7 +399,7 @@ async fn stream_messages(
 
     let model_id = state.display_model_id().to_string();
     let prompt_cache_enabled = state.prompt_cache.is_some();
-    let prepared = match prepare_chat_request_with_cache(
+    let mut prepared = match prepare_chat_request_with_cache(
         &state.chat_template,
         &translated.chat_request,
         live.chat_template_kwargs.as_ref(),
@@ -424,6 +430,12 @@ async fn stream_messages(
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
     options.image_soft_tokens = prepared.image_soft_tokens;
+    // A native chat renderer (Kimi K3's XTML format, #1338) produced the
+    // prompt as token ids. Handing them to the provider is what keeps the
+    // rendered structure intact: re-tokenizing `prepared.prompt` would have to
+    // re-recognize control-token spellings, which is the injection surface the
+    // native renderer closes. `None` for every template-rendered request.
+    options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
     // Forced tool-call grammar (#1319), built at the request boundary.
     options.structured = structured;
@@ -729,12 +741,19 @@ pub async fn anthropic_count_tokens(
         Err(err) => return AnthropicErrorResponse::bad_request(err.to_string()).into_response(),
     };
 
-    let token_count = match state.tokenizer.encode(&prepared.prompt, true) {
-        Ok(ids) => ids.len(),
-        Err(e) => {
-            return AnthropicErrorResponse::bad_request(format!("Tokenization error: {e}"))
-                .into_response();
-        }
+    // A native chat renderer already produced this prompt's exact ids (#1338),
+    // so count those rather than re-encoding the text form: the text is a
+    // faithful rendering, but re-encoding it would re-recognize control-token
+    // spellings that came from message bodies.
+    let token_count = match prepared.prompt_token_ids.as_ref() {
+        Some(ids) => ids.len(),
+        None => match state.tokenizer.encode(&prepared.prompt, true) {
+            Ok(ids) => ids.len(),
+            Err(e) => {
+                return AnthropicErrorResponse::bad_request(format!("Tokenization error: {e}"))
+                    .into_response();
+            }
+        },
     };
 
     (
